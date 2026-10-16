@@ -79,8 +79,17 @@ fn target_config() -> TargetConfig {
             ..Default::default()
         },
 
-        "macos" | "ios" | "tvos" | "watchos" | "visionos" => TargetConfig {
-            link_directives: cxx_runtime("c++"),
+        "macos" | "tvos" | "watchos" | "visionos" => TargetConfig {
+            link_directives: apple_cxx_runtime(),
+            ..Default::default()
+        },
+
+        // iOS must cross-compile the C++ kernel against a different SDK/arch
+        // than the host. Upstream treats iOS as macOS and produces host (macOS)
+        // objects, which fail to link into iOS apps. (coconut_wallet vendoring patch)
+        "ios" => TargetConfig {
+            cmake_args: ios_cmake_args(),
+            link_directives: apple_cxx_runtime(),
             ..Default::default()
         },
 
@@ -112,6 +121,66 @@ fn cxx_runtime(clang_lib: &str) -> Vec<String> {
     };
 
     vec![format!("rustc-link-lib=dylib={lib}")]
+}
+
+/// Apple platforms always use clang/libc++, so do not rely on cc detection.
+/// cc mis-detects the device (iPhoneOS) target as GNU and emits `-lstdc++`,
+/// which breaks the iOS link, so link `c++` explicitly (vendored patch).
+fn apple_cxx_runtime() -> Vec<String> {
+    vec!["rustc-link-lib=dylib=c++".into()]
+}
+
+/// CMake arguments for iOS (iPhoneOS/simulator) cross-compilation.
+/// Upstream 0.4.1 treats iOS as macOS and produces host C++ objects.
+fn ios_cmake_args() -> Vec<String> {
+    let target = env::var("TARGET").unwrap_or_default();
+    let is_simulator = target.ends_with("-sim");
+    let sdk = if is_simulator { "iphonesimulator" } else { "iphoneos" };
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let arch = match target_arch.as_str() {
+        "aarch64" => "arm64",
+        "x86_64" => "x86_64",
+        other => other,
+    };
+    let mut args = vec![
+        "-DCMAKE_SYSTEM_NAME=iOS".into(),
+        format!("-DCMAKE_OSX_SYSROOT={sdk}"),
+        format!("-DCMAKE_OSX_ARCHITECTURES={arch}"),
+        // Match the default deployment target of the Rust target
+        // (aarch64-apple-ios-sim).
+        "-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0".into(),
+    ];
+    // Boost headers required by Bitcoin Core's cmake. In iOS cross-compilation
+    // the toolchain search path cannot find host packages, so pass them explicitly.
+    if let Some(root) = boost_root() {
+        args.push(format!("-DBOOST_ROOT={root}"));
+        args.push(format!("-DCMAKE_PREFIX_PATH={root}"));
+        args.push("-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH".into());
+    }
+    args
+}
+
+/// Find the Boost prefix installed on the host (BOOST_ROOT -> brew -> common paths).
+fn boost_root() -> Option<String> {
+    if let Ok(p) = env::var("BOOST_ROOT") {
+        if !p.is_empty() && Path::new(&p).exists() {
+            return Some(p);
+        }
+    }
+    if let Ok(out) = Command::new("brew").args(["--prefix", "boost"]).output() {
+        if out.status.success() {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !p.is_empty() && Path::new(&p).exists() {
+                return Some(p);
+            }
+        }
+    }
+    for candidate in ["/opt/homebrew/opt/boost", "/usr/local/opt/boost"] {
+        if Path::new(candidate).exists() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
